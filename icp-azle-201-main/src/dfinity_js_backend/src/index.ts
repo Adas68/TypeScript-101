@@ -34,6 +34,46 @@ const LoanRequest = Record({
     duration: nat64
 });
 
+const UserProfile = Record({
+    principal: Principal,
+    name: text,
+    balance: nat64
+});
+
+const Message = Variant({
+    NotFound: text,
+    InvalidPayload: text,
+    PaymentFailed: text,
+    PaymentCompleted: text
+});
+type Loan = {
+    id: string;
+    amount: bigint;
+    interestRate: bigint;
+    duration: bigint;
+    borrower: Principal;
+    lender: Principal;
+    status: { Active?: string; Completed?: string; Defaulted?: string; }; // Adjust based on actual structure
+    creationDate: bigint;
+    dueDate: bigint;
+};
+
+interface LoanSummaryType {
+    id: string;
+    originalAmount: bigint;
+    currentAmount: bigint;
+    interestRate: bigint;
+    duration: bigint;
+    borrower: Principal;
+    lender?: Principal;
+    // status: string;
+    status: string | undefined;
+    creationDate: bigint;
+    dueDate: bigint;
+    accumulatedInterest: bigint;
+}
+
+
 const loansStorage = StableBTreeMap<string, Loan>(0);
 const loanRequestsStorage = StableBTreeMap<Principal, LoanRequest[]>(1);
 const userProfiles = StableBTreeMap<Principal, { name: string, balance: nat64 }>(3);
