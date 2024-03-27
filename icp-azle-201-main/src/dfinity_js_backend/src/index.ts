@@ -1,147 +1,91 @@
-import { query, update, text, Record, StableBTreeMap, Variant, Vec, None, Some, Ok, Err, ic, Principal, Opt, nat64, Duration, Result, bool, Canister } from "azle";
-import { Ledger, binaryAddressFromAddress, binaryAddressFromPrincipal, hexAddressFromPrincipal } from "azle/canisters/ledger";
-import { hashCode } from "hashcode";
+import { update, text, Record, StableBTreeMap, Principal, Opt, nat64, Result } from "azle";
 import { v4 as uuidv4 } from "uuid";
 
-const LoanStatus = Variant({
+/**
+ * Represents the status of a loan.
+ */
+const LoanStatus = Record({
     Active: text,
     Completed: text,
     Defaulted: text
 });
 
+/**
+ * Represents a loan record.
+ */
 const Loan = Record({
     id: text,
     amount: nat64,
     interestRate: nat64,
     duration: nat64,
     borrower: Principal,
-    //lender: Principal,
     lender: Opt(Principal),
     status: LoanStatus,
     creationDate: nat64,
     dueDate: nat64
 });
 
+/**
+ * Represents a loan request.
+ */
 const LoanRequest = Record({
     amount: nat64,
     interestRate: nat64,
     duration: nat64
 });
 
-const UserProfile = Record({
-    principal: Principal,
-    name: text,
-    balance: nat64
-});
+const loansStorage = StableBTreeMap<string, Loan>(0);
+const loanRequestsStorage = StableBTreeMap<Principal, LoanRequest[]>(1);
+const userProfiles = StableBTreeMap<Principal, { name: string, balance: nat64 }>(3);
 
-const Message = Variant({
-    NotFound: text,
-    InvalidPayload: text,
-    PaymentFailed: text,
-    PaymentCompleted: text
-});
-type Loan = {
-    id: string;
-    amount: bigint;
-    interestRate: bigint;
-    duration: bigint;
-    borrower: Principal;
-    lender: Principal;
-    status: { Active?: string; Completed?: string; Defaulted?: string; }; // Adjust based on actual structure
-    creationDate: bigint;
-    dueDate: bigint;
-};
-
-interface LoanSummaryType {
-    id: string;
-    originalAmount: bigint;
-    currentAmount: bigint;
-    interestRate: bigint;
-    duration: bigint;
-    borrower: Principal;
-    lender?: Principal;
-    // status: string;
-    status: string | undefined;
-    creationDate: bigint;
-    dueDate: bigint;
-    accumulatedInterest: bigint;
-}
-
-const loansStorage = StableBTreeMap(0, text, Loan);
-const loanRequestsStorage = StableBTreeMap(1, Principal, Vec(LoanRequest));
-const userProfiles = StableBTreeMap(3, Principal, UserProfile);
-
-
-export default Canister({
-    registerUser: update([text], Result(text, Message), (name) => {
-        const userProfile = {
-            principal: ic.caller(),
-            name: name,
-            balance: 0n
-        };
-
-        userProfiles.insert(ic.caller(), userProfile);
-        return Ok(`User ${name} registered successfully with principal ${ic.caller().toText()}`);
+export default {
+    registerUser: update([text], Result(text, text), (name, caller) => {
+        const userProfile = { name, balance: 0n };
+        userProfiles.insert(caller, userProfile);
+        return `User ${name} registered successfully with principal ${caller.toText()}`;
     }),
 
-    saveFunds: update([nat64], Result(text, Message), async (amount) => {
-        const userOpt = userProfiles.get(ic.caller());
-        if ("None" in userOpt) {
-            return Err({ NotFound: `User not found` });
-        }
-
-        const user = userOpt.Some;
-        user.balance += amount;
-        userProfiles.insert(user.principal, user);
-
-        return Ok(`Amount ${amount} saved successfully.`);
+    saveFunds: update([nat64], Result(text, text), async (amount, caller) => {
+        const userProfile = userProfiles.get(caller);
+        if (!userProfile) return `User not found`;
+        userProfile.balance += amount;
+        userProfiles.insert(caller, userProfile);
+        return `Amount ${amount} saved successfully.`;
     }),
 
-
-    createLoanRequest: update([LoanRequest], Result(text, Message), (request) => {
+    createLoanRequest: update([LoanRequest], Result(text, text), (request, caller) => {
         const loanRequestId = uuidv4();
-        loanRequestsStorage.insert(ic.caller(), request);
-        return Ok(loanRequestId);
+        const loanRequests = loanRequestsStorage.get(caller) || [];
+        loanRequests.push(request);
+        loanRequestsStorage.insert(caller, loanRequests);
+        return loanRequestId;
     }),
 
-    acceptLoanRequest: update([text], Result(Loan, Message), (loanRequestId) => {
-        const requestOpt = loanRequestsStorage.get(loanRequestId);
-        if ("None" in requestOpt) {
-            return Err({ NotFound: `Loan request with id=${loanRequestId} not found` });
-        }
-    
-        const request = requestOpt.Some;
+    acceptLoanRequest: update([text], Result(Loan, text), (loanRequestId, caller) => {
+        const request = loanRequestsStorage.get(caller)?.find(req => req.id === loanRequestId);
+        if (!request) return `Loan request with id=${loanRequestId} not found`;
+
         const loan = {
             id: uuidv4(),
             amount: request.amount,
             interestRate: request.interestRate,
             duration: request.duration,
-            borrower: ic.caller(),
-            lender: None, // Lender is not assigned yet
+            borrower: caller,
+            lender: null,
             status: { Active: "ACTIVE" },
             creationDate: ic.time(),
             dueDate: ic.time() + request.duration
         };
     
         loansStorage.insert(loan.id, loan);
-        return Ok(loan);
-    }),
-    
-    
-
-    getLoanRequests: query([], Vec(LoanRequest), () => {
-        return loanRequestsStorage.values();
+        return loan;
     }),
 
-    getLoans: query([], Vec(Loan), () => {
-        return loansStorage.values();
-    }),
+    getLoanRequests: () => loanRequestsStorage.get(ic.caller()) || [],
 
-    // Additional functions for loan management, repayments, and status updates
+    getLoans: () => loansStorage.values(),
 
-
-
-    makeRepayment: update([text, nat64], Result(text, Message), (loanId, repaymentAmount) => {
+  makeRepayment: update([text, nat64], Result(text, Message), (loanId, repaymentAmount) => {
         const loanOpt = loansStorage.get(loanId);
         if ("None" in loanOpt) {
             return Err({ NotFound: `Loan with id=${loanId} not found` });
