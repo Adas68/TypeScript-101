@@ -15,7 +15,6 @@ const Loan = Record({
     interestRate: nat64,
     duration: nat64,
     borrower: Principal,
-    //lender: Principal,
     lender: Opt(Principal),
     status: LoanStatus,
     creationDate: nat64,
@@ -40,37 +39,11 @@ const Message = Variant({
     PaymentFailed: text,
     PaymentCompleted: text
 });
-type Loan = {
-    id: string;
-    amount: bigint;
-    interestRate: bigint;
-    duration: bigint;
-    borrower: Principal;
-    lender: Principal;
-    status: { Active?: string; Completed?: string; Defaulted?: string; }; // Adjust based on actual structure
-    creationDate: bigint;
-    dueDate: bigint;
-};
-
-interface LoanSummaryType {
-    id: string;
-    originalAmount: bigint;
-    currentAmount: bigint;
-    interestRate: bigint;
-    duration: bigint;
-    borrower: Principal;
-    lender?: Principal;
-    // status: string;
-    status: string | undefined;
-    creationDate: bigint;
-    dueDate: bigint;
-    accumulatedInterest: bigint;
-}
 
 const loansStorage = StableBTreeMap(0, text, Loan);
 const loanRequestsStorage = StableBTreeMap(1, Principal, Vec(LoanRequest));
 const userProfiles = StableBTreeMap(3, Principal, UserProfile);
-
+const userLoans = StableBTreeMap(4, Principal, Vec(Loan)); // New stable map to store loans for each user
 
 export default Canister({
     registerUser: update([text], Result(text, Message), (name) => {
@@ -96,7 +69,6 @@ export default Canister({
 
         return Ok(`Amount ${amount} saved successfully.`);
     }),
-
 
     createLoanRequest: update([LoanRequest], Result(text, Message), (request) => {
         const loanRequestId = uuidv4();
@@ -124,10 +96,9 @@ export default Canister({
         };
     
         loansStorage.insert(loan.id, loan);
+        userLoans.insert(loan.borrower, [loan]); // Add loan to borrower's loan history
         return Ok(loan);
     }),
-    
-    
 
     getLoanRequests: query([], Vec(LoanRequest), () => {
         return loanRequestsStorage.values();
@@ -136,10 +107,6 @@ export default Canister({
     getLoans: query([], Vec(Loan), () => {
         return loansStorage.values();
     }),
-
-    // Additional functions for loan management, repayments, and status updates
-
-
 
     makeRepayment: update([text, nat64], Result(text, Message), (loanId, repaymentAmount) => {
         const loanOpt = loansStorage.get(loanId);
@@ -157,6 +124,7 @@ export default Canister({
 
         return Ok(`Repayment of ${repaymentAmount} for loan id=${loanId} successful`);
     }),
+
     getLoanStatus: query([text], Result(LoanStatus, Message), (loanId) => {
         const loanOpt = loansStorage.get(loanId);
         if ("None" in loanOpt) {
@@ -165,7 +133,6 @@ export default Canister({
         return Ok(loanOpt.Some.status);
     }),
 
-    // Additional function to check for loan defaults
     checkForDefault: update([], Vec(text), () => {
         const defaultedLoans = loansStorage.values().filter(loan => loanIsDefaulted(loan));
         defaultedLoans.forEach(loan => {
@@ -176,6 +143,7 @@ export default Canister({
         // Return an array of defaulted loan IDs
         return defaultedLoans.map(loan => loan.id);
     }),
+
     modifyLoanTerms: update([text, LoanRequest], Result(Loan, Message), (loanId, newTerms) => {
         const loanOpt = loansStorage.get(loanId);
         if ("None" in loanOpt) {
@@ -185,6 +153,11 @@ export default Canister({
         let loan = loanOpt.Some;
         if (loan.status.Active !== "ACTIVE") {
             return Err({ InvalidPayload: "Loan modification is only allowed for active loans." });
+        }
+
+        // Check if the caller is authorized to modify the loan terms
+        if (loan.borrower != ic.caller() && (loan.lender == None || loan.lender.Some != ic.caller())) {
+            return Err({ InvalidPayload: "You are not authorized to modify this loan." });
         }
     
         // Update loan terms
@@ -196,43 +169,35 @@ export default Canister({
         loansStorage.insert(loan.id, loan);
         return Ok(loan);
     }),
+
     getUserLoanHistory: query([Principal], Vec(Loan), (userPrincipal) => {
-        const userLoans = loansStorage.values().filter(loan =>
-            loan.borrower.toText() === userPrincipal.toText() || 
-            (loan.lender !== None && loan.lender.toText() === userPrincipal.toText())
-        );
-        return userLoans;
+        const userLoansOpt = userLoans.get(userPrincipal);
+        if ("None" in userLoansOpt) {
+            return [];
+        }
+        return userLoansOpt.Some;
     }),
-    accumulateInterest: update([], Vec(text), () => {
-        const activeLoans = loansStorage.values().filter(loan => loan.status.Active === "ACTIVE");
+
+    accumulateInterestAndRepayments: update([], Vec(text), () => {
+        const activeLoans = loansStorage.values().filter(loan => loan.status.Active === "ACTIVE" && !loanIsFullyRepaid(loan));
         const updatedLoans: string[] = [];
     
         activeLoans.forEach(loan => {
             const accumulatedInterest = calculateAccumulatedInterest(loan);
             loan.amount += accumulatedInterest;
+
+            if (shouldAutomateRepayment(loan)) {
+                const repaymentAmount = calculateRepaymentAmount(loan);
+                loan.amount -= repaymentAmount;
+            }
+
             loansStorage.insert(loan.id, loan);
             updatedLoans.push(loan.id);
         });
     
         return updatedLoans;
     }),
-    
-    
-    
-    automateLoanRepayment: update([], Vec(text), () => {
-        const loansForRepayment = loansStorage.values().filter(loan => shouldAutomateRepayment(loan));
-        const repaymentLoanIds: string[] = [];
-    
-        loansForRepayment.forEach(loan => {
-            const repaymentAmount = calculateRepaymentAmount(loan);
-            // Deduct from borrower's balance and update loan
-            loan.amount -= repaymentAmount;
-            loansStorage.insert(loan.id, loan);
-            repaymentLoanIds.push(loan.id);
-        });
-    
-        return repaymentLoanIds;
-    }),
+
     requestLoanExtension: update([text, nat64], Result(Loan, Message), (loanId, newDuration) => {
         const loanOpt = loansStorage.get(loanId);
         if ("None" in loanOpt) {
@@ -246,31 +211,28 @@ export default Canister({
         if (newDuration <= loan.duration) {
             return Err({ InvalidPayload: "New duration must be longer than the current duration." });
         }
+        // Check if the caller is the borrower
+        if (loan.borrower != ic.caller()) {
+            return Err({ InvalidPayload: "You are not authorized to request a loan extension." });
+        }
         loan.duration = newDuration;
         loan.dueDate = calculateDueDate(newDuration);
         loansStorage.insert(loan.id, loan);
         return Ok(loan);
     }),
-      
-    
- 
 });
 
-// function uuidv4(): text {
-//     // UUID generation logic
-//     return "uuid-placeholder";
-// }
+// Utility function to calculate accumulated interest
 function calculateAccumulatedInterest(loan: Loan): bigint {
     // Example simple interest calculation
+    // You can use a more precise formula or a library for financial calculations
     const interest = loan.amount * loan.interestRate / 100n * (ic.time() - loan.creationDate) / (365n * 24n * 60n * 60n);
     return interest;
 }
 
-
-
 function shouldAutomateRepayment(loan: Loan): boolean {
     // Determine criteria for automated repayment
-    return ic.time() >= loan.dueDate;
+    return ic.time() >= loan.dueDate && !loanIsFullyRepaid(loan);
 }
 
 function calculateRepaymentAmount(loan: Loan): bigint {
@@ -279,23 +241,21 @@ function calculateRepaymentAmount(loan: Loan): bigint {
     return accumulatedInterest + partOfPrincipal;
 }
 
-
 function calculateDueDate(duration: nat64): nat64 {
     // Logic to calculate the due date based on the loan duration
     return ic.time() + duration;
 }
 
-
 // Utility function to check if the loan is fully repaid
 function loanIsFullyRepaid(loan: Loan): bool {
     // Implement logic to determine if the loan is fully repaid
-    return false;
+    return false; // Replace with your actual logic
 }
 
 // Utility function to check for loan defaults
 function loanIsDefaulted(loan: Loan): bool {
     // Implement logic to determine if the loan is defaulted based on due dates and repayments
-    return false;
+    return false; // Replace with your actual logic
 }
 
 /*
